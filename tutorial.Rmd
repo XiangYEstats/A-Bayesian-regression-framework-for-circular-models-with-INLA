@@ -1,0 +1,286 @@
+---
+title: "Instruction on circular regression with INLA"
+output: pdf_document
+date: "2026-01-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Preliminaries
+
+```{r}
+# Load required packages
+require(circular)
+require(INLA)
+require(dplyr)
+require(mvtnorm)
+require(ggplot2)
+require(patchwork)
+```
+
+```{r}
+# Load required functions
+source("../functions.R")
+source("../vm.R")             # functions for von Mises distribution
+source("../lavm.R")           # functions for link adjusted von Mises distribution
+```
+
+### Simulation
+
+```{r}
+# Set up model parameters
+n <- 300
+a0 <- 0.2
+a1 <- 0.7
+kappa <- 60
+b0 <- 2
+b1 <- 0.5
+tau <- 300
+```
+
+```{r}
+# Define the prior distribution
+# We use the PC prior for concentration parameter of von Mises distritbuion
+# Define by:
+# the probability that the mean resultant length exceeds "u", is "alpha"
+rprior_x <- INLA::inla.rprior.define(rprior.func, u = 0.5, alpha = 0.5)
+```
+
+```{r}
+# Simulate the covariate z
+z <- rnorm(n, mean = 0, sd = 1)
+# As an example,
+# we assume w is a second order random walk structured latent Gaussian process
+# Define the precision matrix for w
+Q <- INLA:::inla.rw2(n = n, sparse = TRUE, scale.model = TRUE, cyclic=!TRUE)
+diag(Q) <- diag(Q) + 1e-5
+# Simulate latent Gaussian process w
+w <- as.numeric(
+  inla.qsample(1,Q, constr=list(A=matrix(rbind(1, 1:n),2,n),e=c(0,0)))
+  )
+# The linear predictor for circular x
+eta.x <- a0 + a1*w
+# Simulate x from LAVM distribution
+x <- rlavm(n, eta = eta.x, kappa = kappa)
+# Simulate y from Gaussian distribution
+y <- rnorm(n, mean = b0 + b1 * eta.x, sd = 1 / sqrt(tau))
+```
+
+### Bayesian inference with INLA
+
+We first define the model response in matrix form:
+```{r}
+Y <- matrix(NA, 3 * n, 3)
+Y[1:n,             1] <- x      # x observations (von Mises)
+Y[n + 1:n,         2] <- 0      # dummy 0 for link of x
+Y[2*n + 1:n,       3] <- y      # y observations (Gaussian)
+```
+Then, we define the covariate values and the indices of the latent processes in the linear predictor of each models:
+```{r}
+data_stack <- dplyr::bind_rows(
+  # Rows for x (circular outcome)
+  data.frame(a0    = 1,          w    = seq_len(n),
+             u     = NA_real_,   e    = NA_real_,
+             b0    = NA_real_,   b1   = NA_real_),
+  # Rows for x link (dummy Gaussian linking latent linear predictor)
+  data.frame(a0    = 1,          w    = seq_len(n),
+             u     = seq_len(n), e    = -1,
+             b0    = NA_real_,   b1   = NA_real_),
+  # Rows for y (Gaussian outcome)
+  data.frame(a0    = NA_real_,   w    = NA_real_,
+             u     = NA_real_,   e    = NA_real_,
+             b0    = 1,          b1   = seq_len(n))
+)
+```
+Notice that the responses with "0" entries carry the entire linear predictor of $x$ into the linear predictor of $y$ as a whole.
+
+Now, we define the formula to be estimated by INLA
+```{r}
+formula <- Y ~ -1 + a0 + b0 +
+  f(w, model = "rw2", values = 1:n, scale.model = TRUE, constr = TRUE,
+    hyper = list(prec = list(initial = 4,
+                             prior   = "pc.prec",
+                             param   = c(0.5, 0.5),
+                             fixed   = FALSE))) +
+  f(u, e, model = "iid", values = 1:n,
+    hyper = list(prec = list(initial = -12, fixed = TRUE))) +
+  f(b1, copy = "u",
+    hyper = list(beta = list(initial = 0, param = c(0, 1), fixed = FALSE)))
+```
+
+We then fit the model with INLA:
+```{r}
+r <- inla(formula,
+          data = data_stack,
+          family = c("lavm", "gaussian", "gaussian"),
+          control.family = list(
+            list(link = "tan", 
+                 hyper = list(prec = list(initial = 6,
+                                          prior   = rprior_x,
+                                          param   = numeric(0),
+                                          fixed   = FALSE))),
+            list(hyper = list(prec = list(initial = 12, fixed = TRUE))),
+            list(hyper = list(prec = list(initial = 6,
+                                          prior   = "pc.prec", 
+                                          param   = c(0.5, 0.5),
+                                          fixed   = FALSE)))
+          ),
+          control.inla = list(cmin = 0, compute.initial.values = TRUE),
+          control.compute = list(cpo = TRUE, dic = TRUE, waic = TRUE,
+                                 config = TRUE),
+          verbose = FALSE)
+```
+
+We can always rerun the INLA model starting from the previous estimates to make sure the numerical optimisation is stable and more accurate. This is optional.
+```{r}
+r <- inla.rerun(r)
+```
+
+We can briefly skim over the INLA results with
+```{r}
+summary(r)
+```
+
+The entire posterior summary for the fixed effect (intercepts and coefficents for the covariates) can be check by
+```{r}
+r$summary.fixed
+```
+The posterior summary for the hyper parameters (such as model hyperparameters and coefficients related to the latent processes) can be check by
+```{r}
+r$summary.hyperpar
+```
+
+INLA calculate some hyperparameters in different scaling (such as log scale). To directly see the summary in intercal scale, check:
+```{r}
+r$internal.summary.hyperpar
+```
+
+To obtain the entire posterior marginals, we can do
+```{r}
+par(mfrow=c(1,2))
+plot(r$marginals.fixed$a0, type = "l", xlab = expression(a[0]), ylab = "dens")
+plot(r$marginals.fixed$b0, type = "l", xlab = expression(b[0]), ylab = "dens")
+```
+and
+```{r}
+par(mfrow=c(2,3))
+plot(r$marginals.hyperpar$`Precision for link adjusted von Mises observations`,
+     type = "l", xlab = expression(kappa), ylab = "dens")
+plot(r$internal.marginals.hyperpar$`Log precision for link adjusted von Mises observations`,
+     type = "l", xlab = expression(log(kappa)), ylab = "dens")
+plot(r$marginals.hyperpar$`Precision for w`,
+     type = "l",xlab = expression(tau[w]), ylab = "dens")
+plot(r$marginals.hyperpar$`Precision for the Gaussian observations[3]`,
+     type = "l", xlab = expression(tau), ylab = "dens")
+plot(r$internal.marginals.hyperpar$`Log precision for the Gaussian observations[3]`,
+     type = "l", xlab = expression(log(tau)), ylab = "dens")
+plot(r$marginals.hyperpar$`Beta for b1`,
+     type = "l", xlab = expression(b[1]), ylab = "dens")
+```
+
+Moreover, we could also obtain the fitted values for $x$ and $y$:
+```{r}
+par(mfrow=c(1,2))
+plot(x)
+lines(r$summary.fitted.values$mean[1:n], col="red", lwd=2)
+plot(y)
+lines(r$summary.fitted.values$mean[2*n + 1:n], col="red", lwd=2)
+```
+We can also obtain the posterior predictive distributions for $x$ and $y$:
+```{r}
+extract_draws_joint <- function(samps, idx.x, idx.y) {
+  x_pred <- sapply(samps, function(s) {
+    eta_vec <- s$latent[idx.x, 1]
+    kappa_val <- s$hyperpar[[1]] 
+    rlavm(length(eta_vec), eta = eta_vec, kappa = kappa_val)
+  })
+  y_pred <- sapply(samps, function(s) {
+    mu <- s$latent[idx.y, 1]
+    tau_val <- s$hyperpar[[length(s$hyperpar)]]
+    rnorm(length(mu), mean = mu, sd = 1/sqrt(tau_val))
+  })
+  list(x_pred = x_pred, y_pred = y_pred)
+}
+
+n.samp <- 300
+samps <- inla.posterior.sample(n.samp, r)
+
+idx.x <- 1:n
+idx.y <- 2*n + 1:n
+
+draws <- extract_draws_joint(samps, idx.x, idx.y)
+x_pred_mean <- rowMeans(draws$x_pred)
+y_pred_mean <- rowMeans(draws$y_pred)
+
+df_x <- data.frame(
+  value = c(as.numeric(x), x_pred_mean),
+  group = rep(c("True", "Posterior predictive"), each = length(x))
+)
+
+df_y <- data.frame(
+  value = c(as.numeric(y), y_pred_mean),
+  group = rep(c("True", "Posterior predictive"), each = length(y))
+)
+
+cb_palette <- c("True" = "#E69F00", "Posterior predictive" = "#56B4E9")
+lineWidths <- c("True" = 1, "Posterior predictive" = 2.5)
+lineTypes  <- c("True" = "solid", "Posterior predictive" = "dashed")
+
+make_hist_styled <- function(df, xlabel) {
+  ggplot(df, aes(x = value)) +
+    geom_histogram(aes(y = after_stat(density), fill = group),
+                   bins = 30, alpha = 0.4, position = "identity",
+                   color = "white", linewidth = 0.2) +
+    geom_density(aes(color = group, linewidth = group, linetype = group), alpha = 0) +
+    scale_color_manual(values = cb_palette) +
+    scale_fill_manual(values = cb_palette) +
+    scale_linewidth_manual(values = lineWidths) +
+    scale_linetype_manual(values = lineTypes) +
+    labs(x = xlabel, y = NULL) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "top",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 12, face = "bold"),
+      legend.key.width = unit(4, "cm"),
+      panel.grid.minor = element_blank(),
+      legend.margin = margin(t = 0, b = -5, unit = "pt"),
+      legend.box.spacing = unit(5, "pt"),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+}
+
+hx <- make_hist_styled(df_x, "x")
+hy <- make_hist_styled(df_y, "y")
+
+plot_predictives <- (hx | hy) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12, face = "bold"),
+    legend.key.width = unit(4, "cm"),
+    legend.margin = margin(t = 0, b = -5, unit = "pt"),
+    legend.box.spacing = unit(5, "pt"),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+print(plot_predictives)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
